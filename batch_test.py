@@ -1,7 +1,7 @@
 """
-batch_test.py
-Corre el sistema de tracking sobre video0..video6 de forma secuencial.
-Genera un .mp4 y un .csv separado por cada video en la carpeta videos_salida/.
+batch_test.py  —  v2
+Corre el sistema de tracking (StrongSORT + ReID Híbrido) sobre video0..video6.
+Genera archivos con prefijo 'v2_' para no sobreescribir los resultados anteriores.
 """
 
 import cv2
@@ -11,74 +11,105 @@ import math
 import csv
 import time
 
-import config  # Solo para leer DEVICE, DETECTOR_WEIGHTS, etc.
+import config
 from modules.vision import inicializar_modelos
 from modules.ui import crear_lienzo, dibujar_cajas, dibujar_panel
 
 
 # ──────────────────────────────────────────────
-# VIDEOS A PROCESAR
+VIDEOS = [f"videos_para_testear/video{i}.mp4" for i in range(7)]
+PREFIX = "v2"
 # ──────────────────────────────────────────────
-VIDEOS = [f"videos_para_testear/video{i}.mp4" for i in range(7)]  # video0..video6
 
 
-# ──────────────────────────────────────────────
-# SISTEMA DE RECUPERACIÓN DE ID (igual que main.py)
-# ──────────────────────────────────────────────
+def calcular_iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0]); yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2]); yB = min(boxA[3], boxB[3])
+    inter = max(0, xB - xA) * max(0, yB - yA)
+    if inter == 0:
+        return 0.0
+    areaA = (boxA[2]-boxA[0]) * (boxA[3]-boxA[1])
+    areaB = (boxB[2]-boxB[0]) * (boxB[3]-boxB[1])
+    return inter / (areaA + areaB - inter)
+
+
 class IdRecoverySystem:
     def __init__(self):
-        self.id_map = {}
-        self.id_inverso = {}
-        self.ultima_pos = {}
+        self.id_map       = {}
+        self.id_inverso   = {}
+        self.ultima_pos   = {}
         self.ultimo_frame = {}
+        self.histograma   = {}
         self.siguiente_id = 1
 
-    def get_id_estable(self, tracker_id, cx, cy, frame_count):
-        if tracker_id in self.id_map:
-            id_estable = self.id_map[tracker_id]
-            self.ultima_pos[id_estable] = (cx, cy)
-            self.ultimo_frame[id_estable] = frame_count
-            return id_estable
+    def _extraer_histograma(self, frame, x1, y1, x2, y2):
+        ix1=max(0,int(x1)); iy1=max(0,int(y1))
+        ix2=min(frame.shape[1],int(x2)); iy2=min(frame.shape[0],int(y2))
+        crop = frame[iy1:iy2, ix1:ix2]
+        if crop.size == 0: return None
+        hsv  = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv],[0,1],None,[18,8],[0,180,0,256])
+        cv2.normalize(hist, hist)
+        return hist
 
-        mejor_id = None
-        mejor_dist = float('inf')
+    def _similitud(self, ha, hb):
+        if ha is None or hb is None: return 0.5
+        return float(max(0.0, cv2.compareHist(ha, hb, cv2.HISTCMP_CORREL)))
+
+    def _actualizar_hist(self, id_est, h):
+        if h is None: return
+        a = config.TRACK_EMA_ALPHA
+        if id_est in self.histograma and self.histograma[id_est] is not None:
+            self.histograma[id_est] = a*self.histograma[id_est] + (1-a)*h
+        else:
+            self.histograma[id_est] = h.copy()
+
+    def get_id_estable(self, tracker_id, cx, cy, frame_count, frame, bbox):
+        if tracker_id in self.id_map:
+            id_est = self.id_map[tracker_id]
+            self.ultima_pos[id_est]   = (cx, cy)
+            self.ultimo_frame[id_est] = frame_count
+            self._actualizar_hist(id_est, self._extraer_histograma(frame, *bbox))
+            return id_est
+
+        hist_nuevo = self._extraer_histograma(frame, *bbox)
+        mejor_id = None; mejor_score = -float('inf')
+
         for id_est, (ox, oy) in self.ultima_pos.items():
             if id_est in self.id_inverso and self.id_inverso[id_est] in self.id_map:
                 continue
-            frames_perdido = frame_count - self.ultimo_frame.get(id_est, 0)
-            if frames_perdido > config.ID_RECOVERY_MAX_AGE:
+            if frame_count - self.ultimo_frame.get(id_est,0) > config.ID_RECOVERY_MAX_AGE:
                 continue
-            dist = math.hypot(cx - ox, cy - oy)
-            if dist < mejor_dist:
-                mejor_dist = dist
-                mejor_id = id_est
+            dist = math.hypot(cx-ox, cy-oy)
+            if dist > config.ID_RECOVERY_MAX_DIST: continue
+            s = (config.ID_RECOVERY_SPATIAL_WEIGHT    * (1 - dist/config.ID_RECOVERY_MAX_DIST)
+               + config.ID_RECOVERY_APPEARANCE_WEIGHT * self._similitud(hist_nuevo, self.histograma.get(id_est)))
+            if s > mejor_score:
+                mejor_score = s; mejor_id = id_est
 
-        if mejor_id is not None and mejor_dist < config.ID_RECOVERY_MAX_DIST:
-            id_estable = mejor_id
-        else:
-            id_estable = self.siguiente_id
+        id_est = mejor_id if (mejor_id and mejor_score >= config.ID_RECOVERY_SCORE_THRESHOLD) \
+                          else self.siguiente_id
+        if id_est == self.siguiente_id:
             self.siguiente_id += 1
 
-        self.id_map[tracker_id] = id_estable
-        self.id_inverso[id_estable] = tracker_id
-        self.ultima_pos[id_estable] = (cx, cy)
-        self.ultimo_frame[id_estable] = frame_count
-        return id_estable
+        self.id_map[tracker_id]     = id_est
+        self.id_inverso[id_est]     = tracker_id
+        self.ultima_pos[id_est]     = (cx, cy)
+        self.ultimo_frame[id_est]   = frame_count
+        self._actualizar_hist(id_est, hist_nuevo)
+        return id_est
 
     def get_ids_estables_activos(self):
         return set(self.id_map.values())
 
 
-# ──────────────────────────────────────────────
-# FUNCIÓN PRINCIPAL DE PROCESAMIENTO
-# ──────────────────────────────────────────────
 def procesar_video(video_in, video_out, csv_out, model, tracker):
     if not os.path.exists(video_in):
         print(f"  [SKIP] No encontrado: {video_in}")
         return
 
     cap = cv2.VideoCapture(video_in)
-    fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+    fps        = int(cap.get(cv2.CAP_PROP_FPS)) or 30
     vid_width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     vid_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -89,159 +120,147 @@ def procesar_video(video_in, video_out, csv_out, model, tracker):
                           fps, (canvas_width, vid_height))
 
     f_csv = open(csv_out, mode='w', newline='', encoding='utf-8')
-    csv_writer = csv.writer(f_csv)
-    csv_writer.writerow(['Frame', 'ID_Estable', 'ID_Tracker',
-                         'X1', 'Y1', 'X2', 'Y2', 'CX', 'CY', 'Estado'])
+    w     = csv.writer(f_csv)
+    w.writerow(['Frame','ID_Estable','ID_Tracker','X1','Y1','X2','Y2',
+                'CX','CY','En_Oclusion','Estado'])
 
-    recovery = IdRecoverySystem()
+    recovery          = IdRecoverySystem()
     historial_prendas = {}
-    estado_prendas = {}
-    frame_count = 0
-
-    poly_escaner = np.array(config.ZONA_ESCANER, np.int32)
-    poly_bolsa   = np.array(config.ZONA_BOLSA, np.int32)
-
-    # Reiniciar el tracker para cada video
+    estado_prendas    = {}
+    frame_count       = 0
     tracker.reset()
 
-    t_inicio = time.time()
+    poly_escaner = np.array(config.ZONA_ESCANER, np.int32)
+    poly_bolsa   = np.array(config.ZONA_BOLSA,   np.int32)
+
+    t0 = time.time()
 
     while cap.isOpened():
         ret, frame = cap.read()
-        if not ret:
-            break
+        if not ret: break
         frame_count += 1
 
-        # Progreso en consola
         if frame_count % 30 == 0 or frame_count == 1:
-            elapsed = time.time() - t_inicio
-            pct = frame_count / total_frames * 100 if total_frames > 0 else 0
-            print(f"    Frame {frame_count}/{total_frames} ({pct:.0f}%)  |  {elapsed:.1f}s transcurridos", end='\r')
+            pct = frame_count/total_frames*100 if total_frames else 0
+            print(f"    Frame {frame_count}/{total_frames} ({pct:.0f}%)  {time.time()-t0:.0f}s", end='\r')
 
         canvas, _, _ = crear_lienzo(frame, vid_width, vid_height, panel_width)
-        alerta_global = False
 
         results = model.predict(
-            frame,
-            conf=config.DET_CONFIDENCE,
-            iou=0.15,
-            agnostic_nms=True,
-            device=config.DEVICE,
-            verbose=False,
-            classes=config.TARGET_CLASSES
+            frame, conf=config.DET_CONFIDENCE, iou=0.15,
+            agnostic_nms=True, device=config.DEVICE,
+            verbose=False, classes=config.TARGET_CLASSES
         )
 
-        raw_det = []
-        tracks  = []
+        raw_det = []; tracks = []
 
         if len(results[0].boxes) > 0:
             cajas_crudas = results[0].boxes.data.cpu().numpy()
-
-            boxes_nms = []
-            confs_nms = []
+            boxes_nms=[]; confs_nms=[]
             for caja in cajas_crudas:
-                rx1, ry1, rx2, ry2, rconf, rcls = caja
-                boxes_nms.append([int(rx1), int(ry1), int(rx2 - rx1), int(ry2 - ry1)])
+                rx1,ry1,rx2,ry2,rconf,_ = caja
+                boxes_nms.append([int(rx1),int(ry1),int(rx2-rx1),int(ry2-ry1)])
                 confs_nms.append(float(rconf))
 
             indices = cv2.dnn.NMSBoxes(boxes_nms, confs_nms,
                                        score_threshold=config.DET_CONFIDENCE,
-                                       nms_threshold=0.3)
-
+                                       nms_threshold=config.NMS_IOU)
             raw_filtrado = []
             if len(indices) > 0:
                 for i in indices.flatten():
                     caja = cajas_crudas[i]
-                    rx1, ry1, rx2, ry2 = caja[:4]
-                    if (rx2 - rx1) * (ry2 - ry1) > 25000:
+                    rx1,ry1,rx2,ry2 = caja[:4]
+                    if (rx2-rx1)*(ry2-ry1) >= config.MIN_AREA:
                         raw_filtrado.append(caja)
 
             raw_det = np.array(raw_filtrado)
 
             if len(raw_det) > 0:
                 tracks_raw = tracker.update(raw_det, frame)
-
-                tracks_estables = []
+                tracks_est = []
                 for t in tracks_raw:
-                    x1, y1, x2, y2, tracker_id, conf, cls, ind = t
-                    tracker_id = int(tracker_id)
-                    cx = int((x1 + x2) / 2)
-                    cy = int((y1 + y2) / 2)
-                    id_estable = recovery.get_id_estable(tracker_id, cx, cy, frame_count)
-                    tracks_estables.append((x1, y1, x2, y2, id_estable, tracker_id, conf, cls, cx, cy))
+                    x1,y1,x2,y2,tid,conf,cls,ind = t
+                    tid=int(tid)
+                    cx=int((x1+x2)/2); cy=int((y1+y2)/2)
+                    ide = recovery.get_id_estable(tid,cx,cy,frame_count,frame,(x1,y1,x2,y2))
+                    tracks_est.append((x1,y1,x2,y2,ide,tid,conf,cls,cx,cy))
 
-                for (x1, y1, x2, y2, id_estable, tracker_id, conf, cls, cx, cy) in tracks_estables:
-                    if id_estable not in historial_prendas:
-                        historial_prendas[id_estable] = {
-                            "paso_escaner": False,
-                            "estado": "Detectando...",
-                            "frames_sospechosos": 0,
-                            "ultima_pos": (cx, cy)
+                # Oclusiones
+                ids_ocl = set()
+                for i in range(len(tracks_est)):
+                    for j in range(i+1, len(tracks_est)):
+                        if calcular_iou(tracks_est[i][:4], tracks_est[j][:4]) >= config.OCCLUSION_IOU_THRESH:
+                            ids_ocl.add(tracks_est[i][4]); ids_ocl.add(tracks_est[j][4])
+
+                for (x1,y1,x2,y2,ide,tid,conf,cls,cx,cy) in tracks_est:
+                    en_ocl = ide in ids_ocl
+                    if ide not in historial_prendas:
+                        historial_prendas[ide] = {
+                            "paso_escaner":False,"estado":"Detectando...",
+                            "frames_sospechosos":0,"frames_visible":0,
+                            "ultima_pos":(cx,cy)
                         }
                     else:
-                        historial_prendas[id_estable]["ultima_pos"] = (cx, cy)
+                        historial_prendas[ide]["ultima_pos"] = (cx,cy)
 
-                    en_escaner = cv2.pointPolygonTest(poly_escaner, (cx, cy), False) >= 0
-                    en_bolsa   = cv2.pointPolygonTest(poly_bolsa,   (cx, cy), False) >= 0
+                    historial_prendas[ide]["frames_visible"] += 1
+                    warmup = historial_prendas[ide]["frames_visible"] >= config.ZONE_WARMUP_FRAMES
 
-                    if en_escaner:
-                        historial_prendas[id_estable]["paso_escaner"] = True
-                        historial_prendas[id_estable]["estado"] = "Escaneando..."
-                        historial_prendas[id_estable]["frames_sospechosos"] = 0
-                    elif en_bolsa:
-                        if not historial_prendas[id_estable]["paso_escaner"]:
-                            historial_prendas[id_estable]["frames_sospechosos"] += 1
-                            if historial_prendas[id_estable]["frames_sospechosos"] > 15:
-                                historial_prendas[id_estable]["estado"] = "ALERTA: EVASION"
-                                alerta_global = True
+                    if warmup and not en_ocl:
+                        en_esc = cv2.pointPolygonTest(poly_escaner,(cx,cy),False) >= 0
+                        en_bol = cv2.pointPolygonTest(poly_bolsa,  (cx,cy),False) >= 0
+                        if en_esc:
+                            historial_prendas[ide]["paso_escaner"]=True
+                            historial_prendas[ide]["estado"]="Escaneando..."
+                            historial_prendas[ide]["frames_sospechosos"]=0
+                        elif en_bol:
+                            if not historial_prendas[ide]["paso_escaner"]:
+                                historial_prendas[ide]["frames_sospechosos"] += 1
+                                if historial_prendas[ide]["frames_sospechosos"] >= config.ZONE_ALERT_FRAMES:
+                                    historial_prendas[ide]["estado"]="ALERTA: EVASION"
+                                else:
+                                    historial_prendas[ide]["estado"]="Evaluando..."
                             else:
-                                historial_prendas[id_estable]["estado"] = "Evaluando..."
+                                historial_prendas[ide]["estado"]="Desalarmado OK"
+                                historial_prendas[ide]["frames_sospechosos"]=0
                         else:
-                            historial_prendas[id_estable]["estado"] = "Desalarmado OK"
-                            historial_prendas[id_estable]["frames_sospechosos"] = 0
+                            if historial_prendas[ide]["estado"]=="Evaluando...":
+                                historial_prendas[ide]["frames_sospechosos"]=0
+                                historial_prendas[ide]["estado"]="Detectando..."
+                    elif en_ocl:
+                        historial_prendas[ide]["estado"]="Ocluida..."
 
-                    estado_prendas[id_estable] = historial_prendas[id_estable]["estado"]
-
-                    csv_writer.writerow([frame_count, id_estable, tracker_id,
-                                         int(x1), int(y1), int(x2), int(y2),
-                                         cx, cy, estado_prendas[id_estable]])
+                    estado_prendas[ide] = historial_prendas[ide]["estado"]
+                    w.writerow([frame_count,ide,tid,int(x1),int(y1),int(x2),int(y2),
+                                cx,cy,int(en_ocl),estado_prendas[ide]])
 
                 tracks = np.array([
-                    [x1, y1, x2, y2, id_estable, conf, cls, 0]
-                    for (x1, y1, x2, y2, id_estable, tracker_id, conf, cls, cx, cy) in tracks_estables
-                ]) if tracks_estables else []
+                    [x1,y1,x2,y2,ide,conf,cls,0]
+                    for (x1,y1,x2,y2,ide,tid,conf,cls,cx,cy) in tracks_est
+                ]) if tracks_est else []
 
-        ids_unicos = recovery.get_ids_estables_activos()
+        ids_u = recovery.get_ids_estables_activos()
         canvas = dibujar_cajas(canvas, raw_det, tracks, estado_prendas)
         canvas = dibujar_panel(canvas, vid_width, canvas_width, frame_count,
-                               len(raw_det), len(tracks) if len(tracks) > 0 else 0,
-                               len(ids_unicos))
+                               len(raw_det), len(tracks) if hasattr(tracks,'__len__') else 0,
+                               len(ids_u))
         out.write(canvas)
 
-    cap.release()
-    out.release()
-    f_csv.close()
-
-    elapsed_total = time.time() - t_inicio
-    print(f"\n    Listo: {frame_count} frames en {elapsed_total:.1f}s  →  {video_out}")
+    cap.release(); out.release(); f_csv.close()
+    print(f"\n    ✓ {frame_count} frames en {time.time()-t0:.1f}s  →  {video_out}")
 
 
-# ──────────────────────────────────────────────
-# PUNTO DE ENTRADA
-# ──────────────────────────────────────────────
 if __name__ == "__main__":
     os.makedirs("videos_salida", exist_ok=True)
-
-    print("Cargando modelos una sola vez...")
+    print("Cargando modelos (una sola vez)...")
     model, tracker = inicializar_modelos()
-    print("Modelos listos. Iniciando batch...\n")
+    print("Modelos listos. Iniciando batch v2...\n")
 
-    for video_path in VIDEOS:
-        nombre = os.path.splitext(os.path.basename(video_path))[0]  # ej: "video0"
-        video_out = f"videos_salida/resultado_{nombre}.mp4"
-        csv_out   = f"videos_salida/resultado_{nombre}.csv"
+    for vp in VIDEOS:
+        nombre    = os.path.splitext(os.path.basename(vp))[0]
+        video_out = f"videos_salida/{PREFIX}_resultado_{nombre}.mp4"
+        csv_out   = f"videos_salida/{PREFIX}_resultado_{nombre}.csv"
+        print(f"▶  {vp}  →  {video_out}")
+        procesar_video(vp, video_out, csv_out, model, tracker)
 
-        print(f"▶ Procesando {video_path}  →  {video_out}")
-        procesar_video(video_path, video_out, csv_out, model, tracker)
-
-    print("\n✅ Batch completo. Todos los videos procesados.")
+    print(f"\n✅ Batch v2 completo. Revisa la carpeta videos_salida/")

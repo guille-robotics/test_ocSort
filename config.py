@@ -1,43 +1,47 @@
 import torch
 
-# --- RUTAS ---
-VIDEO_IN = "videos_para_testear/video3.mp4"
-VIDEO_OUT = "videos_salida/TEST_giou_recovery_video3.mp4"
-CSV_OUT = "videos_salida/TEST_giou_recovery_video3.csv"
+# --- RUTAS (se sobreescriben en batch_test.py) ---
+VIDEO_IN  = "videos_para_testear/video3.mp4"
+VIDEO_OUT = "videos_salida/v2_resultado_video3.mp4"
+CSV_OUT   = "videos_salida/v2_resultado_video3.csv"
 CROPS_DIR = "recortes_ropa_final_osnet17"
 
 # --- MODELOS ---
-DEVICE = 'cuda' # Forzado a usar GPU (RTX 2070). Si da error, falta el PyTorch con CUDA.
+DEVICE           = 'cuda' if torch.cuda.is_available() else 'cpu'
 DETECTOR_WEIGHTS = 'weights/detector/FAL-zi_v1_DB-egana-v2_best.pt'
-REID_WEIGHTS = 'osnet_x1_0_msmt17.pt' 
+REID_WEIGHTS     = 'osnet_x1_0_msmt17.pt'
 
 # --- PARÁMETROS DE VISIÓN ---
-TARGET_CLASSES = [0]  
-DET_CONFIDENCE = 0.2
+TARGET_CLASSES  = [0]
+DET_CONFIDENCE  = 0.2
+NMS_IOU         = 0.3    # NMS manual antes de enviar al tracker
+MIN_AREA        = 25000  # píxeles² mínimos para aceptar una detección
 
-# --- PARÁMETROS OC-SORT ---
-# GIoU como función de asociación: funciona incluso cuando las cajas NO se superponen.
-# Esto es clave para movimientos bruscos donde el IoU cae a 0 y el tracker pierde la pista.
-TRACK_MAX_AGE = 60        # Mantener el track vivo max 2 segundos sin detección (a 30fps)
-TRACK_MIN_HITS = 2        # 2 detecciones para confirmar una prenda nueva
-TRACK_IOU = 0.20          # Umbral mínimo de asociación
-TRACK_ASSO_FUNC = 'giou'  # GIoU tolera desplazamientos bruscos (NO usar 'iou' puro)
-TRACK_DELTA_T = 5         # Ventana de velocidad del filtro de Kalman (más alta = más tolerante a saltos)
-TRACK_INERTIA = 0.4       # Inercia del predictor (más alta = prioriza predicción ante saltos)
+# --- PARÁMETROS STRONGSORT ---
+# StrongSORT usa EMA de embeddings de apariencia → memoria visual tras oclusiones.
+TRACK_MAX_AGE      = 60    # frames que un track puede estar perdido antes de descartarse
+TRACK_MIN_HITS     = 2     # detecciones consecutivas para confirmar un track nuevo
+TRACK_MAX_DIST     = 0.25  # distancia coseno máxima para match de apariencia (0=idéntico)
+TRACK_MAX_IOU_DIST = 0.70  # distancia IoU máxima para match espacial
+TRACK_EMA_ALPHA    = 0.90  # suavizado EMA de features (más alto = memoria más larga)
+TRACK_MC_LAMBDA    = 0.995 # peso de momentum en la predicción
+TRACK_NN_BUDGET    = 100   # máximo de embeddings almacenados por track
 
-# --- PARÁMETROS RECUPERACIÓN DE ID ---
-# Distancia máxima (en píxeles) para considerar que un ID nuevo es el mismo que uno perdido.
-# Para una cámara cenital a esa altura, 200px es un salto brusco pero plausible.
-ID_RECOVERY_MAX_DIST = 200   # píxeles
-ID_RECOVERY_MAX_AGE  = 45    # frames que puede estar perdido un track y aun así recuperarse
+# --- PARÁMETROS RECUPERACIÓN DE ID HÍBRIDA ---
+# Combina distancia espacial + similitud de histograma de color HSV.
+ID_RECOVERY_MAX_DIST          = 250   # px máx para buscar un match espacial
+ID_RECOVERY_MAX_AGE           = 60    # frames máx que puede llevar perdido un track
+ID_RECOVERY_SCORE_THRESHOLD   = 0.30  # score mínimo combinado para recuperar un ID
+ID_RECOVERY_SPATIAL_WEIGHT    = 0.35  # peso de la distancia espacial en el score
+ID_RECOVERY_APPEARANCE_WEIGHT = 0.65  # peso de la similitud de color en el score
 
-# ==========================================
-# NUEVO: ZONAS DE INTERÉS (ROI)
-# Coordenadas (X, Y) para dibujar los polígonos. 
-# AJUSTA ESTOS VALORES según la vista de tu cámara.
-# ==========================================
+# --- PARÁMETROS LÓGICA DE ZONAS ---
+ZONE_WARMUP_FRAMES   = 20   # Frames de gracia antes de aplicar lógica de alerta a un ID nuevo
+ZONE_ALERT_FRAMES    = 20   # Frames consecutivos en zona bolsa sin escanear para disparar alerta
+OCCLUSION_IOU_THRESH = 0.30 # IoU entre dos prendas para considerarlas en oclusión
+
 # ==========================================
 # ZONAS DE INTERÉS (ROI)
 # ==========================================
 ZONA_ESCANER = [(642, 12), (645, 433), (1098, 420), (1099, 14)]
-ZONA_BOLSA = [(1172, 20), (1184, 403), (1475, 403), (1466, 40)]
+ZONA_BOLSA   = [(1172, 20), (1184, 403), (1475, 403), (1466, 40)]
