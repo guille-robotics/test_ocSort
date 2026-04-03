@@ -1,0 +1,89 @@
+# ============================================================
+# PYTHON
+# ============================================================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+
+# Entornos virtuales
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# ============================================================
+# MODELOS Y PESOS (archivos grandes, no van en git)
+# ============================================================
+weights/
+*.pt
+*.pth
+*.onnx
+*.engine
+*.trt
+
+# Modelos de ReID descargados automaticamente
+osnet_*.pt
+osnet_*.pth
+
+# ============================================================
+# VIDEOS (demasiado pesados para un repositorio)
+# ============================================================
+videos_para_testear/
+videos_salida/
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# ============================================================
+# DATOS GENERADOS POR EL SISTEMA
+# ============================================================
+# Recortes de prendas detectadas
+recortes_ropa_final_osnet17/
+
+# Reportes CSV de resultados
+*.csv
+
+# ============================================================
+# CONFIGURACIÓN LOCAL / SECRETOS
+# Sus rutas absolutas y credenciales no deben subirse
+# ============================================================
+.env
+*.env
+config_local.py
+
+# ============================================================
+# SISTEMA OPERATIVO
+# ============================================================
+# Windows
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# ============================================================
+# IDEs y EDITORES
+# ============================================================
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ============================================================
+# JUPYTER (por si se usa en el futuro)
+# ============================================================
+.ipynb_checkpoints/
+*.ipynb
