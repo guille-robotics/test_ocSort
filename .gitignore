@@ -44,6 +44,8 @@ videos_salida/
 *.avi
 *.mov
 *.mkv
+*.png
+*.csv
 
 # ============================================================
 # DATOS GENERADOS POR EL SISTEMA
