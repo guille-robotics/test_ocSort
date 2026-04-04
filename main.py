@@ -3,7 +3,9 @@ import os
 import numpy as np
 import math
 import csv
+import yaml
 import config
+from pathlib import Path
 from modules.vision import inicializar_modelos
 from modules.ui import crear_lienzo, dibujar_cajas, dibujar_panel
 
@@ -13,7 +15,7 @@ from modules.ui import crear_lienzo, dibujar_cajas, dibujar_panel
 # ==============================================================================
 
 def calcular_iou(boxA, boxB):
-    """IoU entre dos cajas [x1,y1,x2,y2]. Usado para detectar oclusiones."""
+    """IoU entre dos cajas [x1,y1,x2,y2]."""
     xA = max(boxA[0], boxB[0])
     yA = max(boxA[1], boxB[1])
     xB = min(boxA[2], boxB[2])
@@ -26,24 +28,52 @@ def calcular_iou(boxA, boxB):
     return inter / (areaA + areaB - inter)
 
 
+def cargar_roi_para_video(video_path: str, yaml_path: str = "config.yaml"):
+    """
+    Carga los polígonos de ROI del YAML para el video dado.
+    Si no hay entrada en el YAML usa los valores de config.py.
+    """
+    clave = Path(video_path).stem  # e.g. "video3"
+    rois  = {}
+
+    if os.path.exists(yaml_path):
+        with open(yaml_path, "r", encoding="utf-8") as f:
+            rois = yaml.safe_load(f) or {}
+
+    if clave in rois:
+        escaner = np.array(rois[clave]["Zona_Escaner"], np.int32)
+        bolsa   = np.array(rois[clave]["Zona_Bolsa"],   np.int32)
+        print(f"[ROI] '{clave}' → usando ROI del YAML")
+    else:
+        escaner = np.array(config.ZONA_ESCANER, np.int32)
+        bolsa   = np.array(config.ZONA_BOLSA,   np.int32)
+        print(f"[ROI] '{clave}' → usando ROI de config.py (fallback)")
+
+    return escaner, bolsa
+
+
 # ==============================================================================
 # SISTEMA DE RECUPERACIÓN DE ID HÍBRIDO
-# Combina distancia espacial + similitud de color HSV para reasignar IDs
-# perdidos a tracks nuevos, incluso tras oclusiones largas.
 # ==============================================================================
 
 class IdRecoverySystem:
-    def __init__(self):
-        self.id_map       = {}   # tracker_id  -> id_estable
-        self.id_inverso   = {}   # id_estable  -> tracker_id activo
-        self.ultima_pos   = {}   # id_estable  -> (cx, cy)
-        self.ultimo_frame = {}   # id_estable  -> último frame visible
-        self.histograma   = {}   # id_estable  -> histograma HSV (EMA)
-        self.siguiente_id = 1
+    """
+    Mantiene IDs estables, recuperando el ID original cuando StrongSORT
+    crea uno nuevo tras una oclusión.
 
-    # ------------------------------------------------------------------
+    v3: agrega TRACK_MIN_STABLE_FRAMES para filtrar tracks de ruido efímeros.
+    """
+    def __init__(self):
+        self.id_map        = {}
+        self.id_inverso    = {}
+        self.ultima_pos    = {}
+        self.ultimo_frame  = {}
+        self.histograma    = {}
+        self.frames_vistos = {}
+        self.confirmado    = {}
+        self.siguiente_id  = 1
+
     def _extraer_histograma(self, frame, x1, y1, x2, y2):
-        """Histograma HSV 18×8 normalizado del recorte de la prenda."""
         ix1 = max(0, int(x1));  iy1 = max(0, int(y1))
         ix2 = min(frame.shape[1], int(x2)); iy2 = min(frame.shape[0], int(y2))
         crop = frame[iy1:iy2, ix1:ix2]
@@ -55,15 +85,11 @@ class IdRecoverySystem:
         return hist
 
     def _similitud_apariencia(self, hist_a, hist_b):
-        """Correlación de Pearson entre histogramas: -1..1 (1=idéntico)."""
         if hist_a is None or hist_b is None:
-            return 0.5   # neutral si no hay datos
-        score = cv2.compareHist(hist_a, hist_b, cv2.HISTCMP_CORREL)
-        return float(max(0.0, score))
+            return 0.5
+        return float(max(0.0, cv2.compareHist(hist_a, hist_b, cv2.HISTCMP_CORREL)))
 
-    # ------------------------------------------------------------------
     def _actualizar_histograma(self, id_estable, nuevo_hist):
-        """EMA de histograma: mezcla el nuevo con el acumulado."""
         if nuevo_hist is None:
             return
         alpha = config.TRACK_EMA_ALPHA
@@ -73,47 +99,34 @@ class IdRecoverySystem:
         else:
             self.histograma[id_estable] = nuevo_hist.copy()
 
-    # ------------------------------------------------------------------
     def get_id_estable(self, tracker_id, cx, cy, frame_count, frame, bbox):
-        """
-        Dado un tracker_id (puede cambiar entre frames) devuelve el ID
-        estable que se muestra al usuario, recuperando el ID original si
-        es posible cuando StrongSORT crea uno nuevo tras una oclusión.
-        """
-        # ── Caso 1: tracker_id ya conocido → solo actualizar ──────────
         if tracker_id in self.id_map:
             id_estable = self.id_map[tracker_id]
-            self.ultima_pos[id_estable]   = (cx, cy)
-            self.ultimo_frame[id_estable] = frame_count
+            self.ultima_pos[id_estable]    = (cx, cy)
+            self.ultimo_frame[id_estable]  = frame_count
+            self.frames_vistos[id_estable] = self.frames_vistos.get(id_estable, 0) + 1
+            if self.frames_vistos[id_estable] >= config.TRACK_MIN_STABLE_FRAMES:
+                self.confirmado[id_estable] = True
             nuevo_hist = self._extraer_histograma(frame, *bbox)
             self._actualizar_histograma(id_estable, nuevo_hist)
             return id_estable
 
-        # ── Caso 2: tracker_id NUEVO → buscar match ───────────────────
-        hist_nuevo = self._extraer_histograma(frame, *bbox)
-
+        hist_nuevo  = self._extraer_histograma(frame, *bbox)
         mejor_id    = None
         mejor_score = -float('inf')
 
         for id_est, (ox, oy) in self.ultima_pos.items():
-            # Saltar IDs que ya tienen un tracker_id activo asignado
             if id_est in self.id_inverso and self.id_inverso[id_est] in self.id_map:
                 continue
-
-            # Saltar IDs que llevan demasiado tiempo perdidos
-            frames_perdido = frame_count - self.ultimo_frame.get(id_est, 0)
-            if frames_perdido > config.ID_RECOVERY_MAX_AGE:
+            if frame_count - self.ultimo_frame.get(id_est, 0) > config.ID_RECOVERY_MAX_AGE:
                 continue
-
-            # Distancia espacial
             dist = math.hypot(cx - ox, cy - oy)
             if dist > config.ID_RECOVERY_MAX_DIST:
                 continue
 
             score_dist = 1.0 - (dist / config.ID_RECOVERY_MAX_DIST)
-            score_apar = self._similitud_apariencia(hist_nuevo,
-                                                    self.histograma.get(id_est))
-
+            score_apar = self._similitud_apariencia(
+                hist_nuevo, self.histograma.get(id_est))
             score_total = (config.ID_RECOVERY_SPATIAL_WEIGHT    * score_dist
                          + config.ID_RECOVERY_APPEARANCE_WEIGHT * score_apar)
 
@@ -121,18 +134,19 @@ class IdRecoverySystem:
                 mejor_score = score_total
                 mejor_id    = id_est
 
-        # Decidir si recuperar o crear nuevo ID
         if mejor_id is not None and mejor_score >= config.ID_RECOVERY_SCORE_THRESHOLD:
             id_estable = mejor_id
         else:
             id_estable = self.siguiente_id
             self.siguiente_id += 1
 
-        # Registrar asociación
-        self.id_map[tracker_id]      = id_estable
-        self.id_inverso[id_estable]  = tracker_id
-        self.ultima_pos[id_estable]  = (cx, cy)
+        self.id_map[tracker_id]       = id_estable
+        self.id_inverso[id_estable]   = tracker_id
+        self.ultima_pos[id_estable]   = (cx, cy)
         self.ultimo_frame[id_estable] = frame_count
+        self.frames_vistos[id_estable]= self.frames_vistos.get(id_estable, 0) + 1
+        if self.frames_vistos[id_estable] >= config.TRACK_MIN_STABLE_FRAMES:
+            self.confirmado[id_estable] = True
         self._actualizar_histograma(id_estable, hist_nuevo)
         return id_estable
 
@@ -158,24 +172,24 @@ def main():
     out = cv2.VideoWriter(config.VIDEO_OUT, cv2.VideoWriter_fourcc(*'mp4v'),
                           fps, (canvas_width, vid_height))
 
-    # CSV
+    # CSV detalle
     os.makedirs(os.path.dirname(config.CSV_OUT) or '.', exist_ok=True)
     f_csv = open(config.CSV_OUT, mode='w', newline='', encoding='utf-8')
     csv_writer = csv.writer(f_csv)
     csv_writer.writerow(['Frame', 'ID_Estable', 'ID_Tracker',
                          'X1', 'Y1', 'X2', 'Y2', 'CX', 'CY',
-                         'En_Oclusion', 'Estado'])
+                         'En_Oclusion', 'Estado', 'Confirmado'])
 
-    recovery         = IdRecoverySystem()
+    # ROI del YAML (o fallback)
+    poly_escaner, poly_bolsa = cargar_roi_para_video(config.VIDEO_IN)
+
+    recovery          = IdRecoverySystem()
     historial_prendas = {}
     estado_prendas    = {}
     ids_guardados     = set()
     frame_count       = 0
 
-    poly_escaner = np.array(config.ZONA_ESCANER, np.int32)
-    poly_bolsa   = np.array(config.ZONA_BOLSA,   np.int32)
-
-    print("Procesando con StrongSORT + ReID Híbrido v2...")
+    print("Procesando con StrongSORT + ReID Híbrido v3 (ROI YAML)...")
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -186,7 +200,7 @@ def main():
         canvas, _, _ = crear_lienzo(frame, vid_width, vid_height, panel_width)
         alerta_global = False
 
-        # ── 1. Detección RT-DETR ─────────────────────────────────────
+        # ── 1. Detección RT-DETR ─────────────────────────────────────────────
         results = model.predict(
             frame,
             conf=config.DET_CONFIDENCE,
@@ -194,7 +208,8 @@ def main():
             agnostic_nms=True,
             device=config.DEVICE,
             verbose=False,
-            classes=config.TARGET_CLASSES
+            classes=config.TARGET_CLASSES,
+            half=config.USE_FP16,
         )
 
         raw_det = []
@@ -203,7 +218,6 @@ def main():
         if len(results[0].boxes) > 0:
             cajas_crudas = results[0].boxes.data.cpu().numpy()
 
-            # ── 2. NMS manual ────────────────────────────────────────
             boxes_nms = []; confs_nms = []
             for caja in cajas_crudas:
                 rx1, ry1, rx2, ry2, rconf, _ = caja
@@ -214,7 +228,6 @@ def main():
                                        score_threshold=config.DET_CONFIDENCE,
                                        nms_threshold=config.NMS_IOU)
 
-            # ── 3. Filtro de área ─────────────────────────────────────
             raw_filtrado = []
             if len(indices) > 0:
                 for i in indices.flatten():
@@ -228,7 +241,6 @@ def main():
             if len(raw_det) > 0:
                 tracks_raw = tracker.update(raw_det, frame)
 
-                # ── 4. Mapear a IDs estables ─────────────────────────
                 tracks_estables = []
                 for t in tracks_raw:
                     x1, y1, x2, y2, tracker_id, conf, cls, ind = t
@@ -243,25 +255,22 @@ def main():
                         (x1, y1, x2, y2, id_est, tracker_id, conf, cls, cx, cy)
                     )
 
-                # ── 5. Detectar oclusiones entre prendas ─────────────
                 ids_en_oclusion = set()
                 for i in range(len(tracks_estables)):
                     for j in range(i + 1, len(tracks_estables)):
                         ta = tracks_estables[i]; tb = tracks_estables[j]
-                        iou_par = calcular_iou(ta[:4], tb[:4])
-                        if iou_par >= config.OCCLUSION_IOU_THRESH:
+                        if calcular_iou(ta[:4], tb[:4]) >= config.OCCLUSION_IOU_THRESH:
                             ids_en_oclusion.add(ta[4])
                             ids_en_oclusion.add(tb[4])
 
-                # ── 6. Lógica de zonas y estado ───────────────────────
                 for (x1, y1, x2, y2, id_est, tracker_id, conf, cls, cx, cy) in tracks_estables:
                     en_oclusion = id_est in ids_en_oclusion
+                    confirmado  = recovery.confirmado.get(id_est, False)
 
-                    # Inicializar historial
                     if id_est not in historial_prendas:
                         historial_prendas[id_est] = {
-                            "paso_escaner":      False,
-                            "estado":            "Detectando...",
+                            "paso_escaner":       False,
+                            "estado":             "Detectando...",
                             "frames_sospechosos": 0,
                             "frames_visible":     0,
                             "ultima_pos":         (cx, cy),
@@ -273,13 +282,12 @@ def main():
                     warmup_ok = (historial_prendas[id_est]["frames_visible"]
                                  >= config.ZONE_WARMUP_FRAMES)
 
-                    # Solo aplicar lógica de zonas si está estabilizado y NO en oclusión
                     if warmup_ok and not en_oclusion:
                         en_escaner = cv2.pointPolygonTest(poly_escaner, (cx, cy), False) >= 0
                         en_bolsa   = cv2.pointPolygonTest(poly_bolsa,   (cx, cy), False) >= 0
 
                         if en_escaner:
-                            historial_prendas[id_est]["paso_escaner"]       = True
+                            historial_prendas[id_est]["paso_escaner"]      = True
                             historial_prendas[id_est]["estado"]             = "Escaneando..."
                             historial_prendas[id_est]["frames_sospechosos"] = 0
                         elif en_bolsa:
@@ -295,23 +303,21 @@ def main():
                                 historial_prendas[id_est]["estado"]             = "Desalarmado OK"
                                 historial_prendas[id_est]["frames_sospechosos"] = 0
                         else:
-                            # Zona neutral: resetear contador de sospecha
                             if historial_prendas[id_est]["estado"] == "Evaluando...":
                                 historial_prendas[id_est]["frames_sospechosos"] = 0
                                 historial_prendas[id_est]["estado"] = "Detectando..."
                     elif en_oclusion:
                         historial_prendas[id_est]["estado"] = "Ocluida..."
-                    # else: en periodo warmup → mantener "Detectando..."
 
                     estado_prendas[id_est] = historial_prendas[id_est]["estado"]
 
-                    # CSV
                     csv_writer.writerow([
                         frame_count, id_est, tracker_id,
                         int(x1), int(y1), int(x2), int(y2),
                         cx, cy,
                         int(en_oclusion),
-                        estado_prendas[id_est]
+                        estado_prendas[id_est],
+                        int(confirmado),
                     ])
 
                     # Guardar primer recorte
@@ -326,7 +332,6 @@ def main():
                             )
                             ids_guardados.add(id_est)
 
-                # Reconstruir tracks con IDs estables para la UI
                 tracks = np.array([
                     [x1, y1, x2, y2, id_est, conf, cls, 0]
                     for (x1, y1, x2, y2, id_est, tracker_id, conf, cls, cx, cy)
@@ -334,7 +339,8 @@ def main():
                 ]) if tracks_estables else []
 
         ids_unicos = recovery.get_ids_estables_activos()
-        canvas = dibujar_cajas(canvas, raw_det, tracks, estado_prendas)
+        canvas = dibujar_cajas(canvas, raw_det, tracks, estado_prendas,
+                               poly_escaner=poly_escaner, poly_bolsa=poly_bolsa)
         canvas = dibujar_panel(canvas, vid_width, canvas_width, frame_count,
                                len(raw_det),
                                len(tracks) if hasattr(tracks, '__len__') else 0,
@@ -344,7 +350,7 @@ def main():
     cap.release()
     out.release()
     f_csv.close()
-    print("Procesamiento finalizado con StrongSORT v2!")
+    print(f"Procesamiento finalizado v3! | IDs únicos: {len(ids_unicos)}")
 
 
 if __name__ == "__main__":
